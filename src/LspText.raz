@@ -1,0 +1,159 @@
+(* LspText: the places and file names a language server uses.
+
+   An editor counts bytes; LSP's usual encoding counts UTF-16 code
+   units. A tab is one unit, a combining mark has its own unit, and a
+   character above U+FFFF takes two. Screen columns play no part.
+   Conversion scans one line, given as its bytes (no line feed): the
+   caller finds the line in its own text, and adds the line's number.
+
+   File URIs quote bytes, including UTF-8, so a space, # or % in a
+   name cannot change its meaning. Only local, absolute paths are
+   accepted. It depends on Str and Buf. Left out: remote URIs,
+   position encodings other than UTF-16, and any text type. *)
+module LspText;
+import Str, Buf, Heap, Out, Rt;
+
+const Hex = "0123456789ABCDEF";    (* the digits of a %XX escape *)
+
+(* The UTF-16 units of line's first col bytes, line being one line's
+   bytes. col may be the line's length. *)
+proc units*(line: []const U8; col: INT): INT;
+var at, units, n: INT; c: I32;
+begin
+    at := 0;
+    units := 0;
+    while at < col do
+        c, n := Str.decode(line[at..LEN(line)]);
+        if n <= 0 then n := 1; end;
+        INC(at, n);
+        INC(units);
+        if c > 0FFFFH then INC(units); end;
+    end;
+    return units;
+end;
+
+(* The byte of line at a server's UTF-16 character:
+   past the line, its end; between a surrogate pair, the character's
+   start. *)
+proc column*(line: []const U8; character: INT): INT;
+var at, units, n: INT; c: I32;
+begin
+    at := 0;
+    while (at < LEN(line)) and (character > 0) do
+        c, n := Str.decode(line[at..LEN(line)]);
+        if n <= 0 then n := 1; end;
+        units := 1;
+        if c > 0FFFFH then units := 2; end;
+        if character < units then break; end;
+        DEC(character, units);
+        INC(at, n);
+    end;
+    return at;
+end;
+
+(* path written as a file URI into out, replacing its old contents.
+   false for a relative path or a NUL byte, with out left empty. *)
+proc uri*(path: []const U8; var out: Buf.Buf): BOOL;
+var i: INT; c: U8;
+begin
+    Buf.reset(out);
+    if (LEN(path) = 0) or (path[0] # '/') then return false; end;
+    for i := 0 to LEN(path) - 1 do
+        if path[i] = 0 then return false; end;
+    end;
+    Buf.str(out, "file://");
+    for i := 0 to LEN(path) - 1 do
+        c := path[i];
+        if Str.isLetter(c) or Str.isDigit(c) or (c = '/') or (c = '-') or (c = '_') or (c = '.') or (c = '~') then
+            Buf.add(out, c);
+        else
+            Buf.add(out, '%');
+            Buf.add(out, Hex[c shr 4]);
+            Buf.add(out, Hex[c & 15]);
+        end;
+    end;
+    return true;
+end;
+
+(* A local file URI decoded into out, replacing its old contents.
+   false, and an empty out, for a malformed or non-local URI. *)
+proc path*(uri: []const U8; var out: Buf.Buf): BOOL;
+var i, a, b: INT; c: U8;
+begin
+    Buf.reset(out);
+    if not Str.hasPrefix(uri, "file:///") then return false; end;
+    i := 7;
+    while i < LEN(uri) do
+        c := uri[i];
+        if c = '%' then
+            if i + 2 >= LEN(uri) then Buf.reset(out); return false; end;
+            a := Str.hexVal(uri[i + 1]);
+            b := Str.hexVal(uri[i + 2]);
+            if (a < 0) or (b < 0) then Buf.reset(out); return false; end;
+            c := U8(a * 16 + b);
+            INC(i, 2);
+        elsif (c <= 32) or (c = '#') or (c = '?') then
+            Buf.reset(out);
+            return false;
+        end;
+        if c = 0 then Buf.reset(out); return false; end;
+        Buf.add(out, c);
+        INC(i);
+    end;
+    return true;
+end;
+
+(* Stop the self-test with what failed. *)
+proc check(ok: BOOL; what: []const U8);
+begin
+    if not ok then Rt.stop(what); end;
+end;
+
+(* Units and columns of one line, whose bytes are 'a', a tab, e acute,
+   a supplementary character and e with a combining mark. *)
+proc places;
+const Line = "a\t\u{e9}\u{1f600}e\u{301}";
+var col: INT;
+begin
+    check(units(Line, 8) = 5, "units of a line's bytes");
+    check(units(Line, 11) = 7, "units of a whole line");
+    check(column(Line, 4) = 4, "middle of a surrogate pair");
+    check(column(Line, 5) = 8, "character after a supplementary one");
+    check(column(Line, 99) = 11, "past a line, its end");
+    check(column("", 10) = 0, "empty line");
+    for col := 0 to LEN(Line) do
+        if (col = 0) or (col = 1) or (col = 2) or (col = 4) or (col = 8) or (col = 9) or (col = 11) then
+            check(column(Line, units(Line, col)) = col, "round trip at a character's start");
+        end;
+    end;
+end;
+
+(* File URIs: escapes, round trip and refusals. *)
+proc names;
+const Name = "/tmp/a b#%?é.ts";
+var out, back: Buf.Buf;
+begin
+    Buf.init(out, Heap.heap);
+    defer Buf.done(out);
+    Buf.init(back, Heap.heap);
+    defer Buf.done(back);
+    check(uri(Name, out), "absolute path");
+    check(Buf.bytes(out) = "file:///tmp/a%20b%23%25%3F%C3%A9.ts", "escape URI bytes");
+    check(path(Buf.bytes(out), back) and (Buf.bytes(back) = Name), "URI round trip");
+    check(not uri("relative.ts", out) and (out.len = 0), "reject relative path");
+    check(not path("file://host/a.ts", back), "reject remote URI");
+    check(not path("file:///a%00.ts", back) and (back.len = 0), "reject NUL");
+    check(not path("file:///a%2", back), "reject short escape");
+    check(not path("file:///a%zz", back), "reject bad escape");
+    check(not path("file:///a#fragment", back), "reject fragment");
+end;
+
+(* Self-test. *)
+proc main*;
+begin
+    places();
+    names();
+    Out.str("LspText passed\n");
+end;
+
+end LspText.

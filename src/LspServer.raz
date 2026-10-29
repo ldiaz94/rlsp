@@ -1,0 +1,369 @@
+(* LspServer: one language server on standard input and output.
+
+   This is a broker's connection, not an editor command. It starts
+   the process, initializes it for one root, queues messages, reads
+   replies and shuts down with shutdown then exit. Requests 1 and 2
+   belong to that lifecycle; the caller numbers its requests from 3.
+
+   next does at most one pipe read or write, then returns. With a
+   wait of zero it never waits for a server to answer. Writes are at
+   most PIPE_BUF (4096 bytes on Linux), after poll says the pipe has
+   room: a large document cannot block the loop while the server is
+   itself waiting to write. The outgoing queue is bounded too.
+
+   Json parses a received body in place. doc and value last until
+   the next call to next; a caller must copy what it keeps. Messages
+   other than lifecycle replies are handed to the caller unchanged.
+   Unsupported server requests get a JSON-RPC error, never silence.
+
+   Diagnostics may be pushed by the server (publishDiagnostics) or
+   pulled by the client (textDocument/diagnostic), as TypeScript's
+   native tsc --lsp does only; both are advertised, and pull says
+   whether the server offers the second. Its request to pull again,
+   workspace/diagnostic/refresh, is answered here and handed on.
+   Completion is advertised as taking no snippets.
+
+   It depends on LspWire, LspText, rjson's Json, Sys, Buf, Heap and
+   Str. Left out: choosing a server, document ownership, restarting
+   and editor UI; those belong to the broker and its client. *)
+module LspServer;
+import LspWire, LspText, Json, Sys, Buf, Heap, Str;
+import SYSTEM;
+
+const
+    MaxQueue = 2 * LspWire.MaxBody;    (* bytes waiting to be written, at most *)
+    Chunk = 4096;                      (* bytes of one pipe read or write *)
+    StartTime = 15000000000;    (* nanoseconds to initialize *)
+    StopTime = 3000000000;      (* nanoseconds to shut down *)
+
+    (* What a failed session's err says. *)
+    Io*: ERROR = "language server pipe failed";
+    Protocol*: ERROR = "invalid language server message";
+    Overflow*: ERROR = "language server output queue is full";
+    Timeout*: ERROR = "language server did not answer in time";
+    Encoding*: ERROR = "language server did not select UTF-16 positions";
+    Rejected*: ERROR = "language server rejected initialization or shutdown";
+
+type
+    (* Where the session is: not yet initialized, serving, shutdown sent,
+       exit sent, over, or failed. *)
+    Phase* = (starting, running, stopping, exiting, ended, failed);
+    (* What next found: nothing, the initialize reply, a message for the
+       caller, a clean end, or a failure. *)
+    Event* = (none, initialized, message, ended, broken);
+
+    (* One server: its process, pipes, reader and output queue. *)
+    Server* = record
+        phase*: Phase;         (* where the session is *)
+        err*: ERROR;           (* the first error kept *)
+        doc*: Json.Doc;        (* holds the last message received *)
+        value*: Json.Value;    (* the last message, in doc *)
+        pull*: BOOL;            (* the server's diagnostics are to be pulled *)
+        client: []const U8;     (* the editor's name, as start was given it *)
+        docReady: BOOL;         (* doc is initialized *)
+        pid, toFd, fromFd: INT; (* the process, the pipe to its stdin, from its stdout *)
+        reader: LspWire.Reader; (* the bytes read, framed *)
+        output: Buf.Buf;        (* framed messages waiting to be written *)
+        sent: INT;              (* bytes of output already written *)
+        deadline: I64;          (* the clock time by which the phase must end *)
+    end;
+
+(* The first error kept, for the caller to report before done. *)
+proc fail(var s: Server; err: ERROR): BOOL;
+begin
+    if s.err = nil then s.err := err; end;
+    s.phase := Phase.failed;
+    return false;
+end;
+
+(* A JSON integer appended to b. *)
+proc number(var b: Buf.Buf; n: I64);
+var digits: [20]U8; k: INT;
+begin
+    digits, k := Str.fromInt(n);
+    Buf.str(b, digits[0..k]);
+end;
+
+(* body queued, with consumed space reclaimed only when needed. *)
+proc queue(var s: Server; body: []const U8): BOOL;
+var bytes: []U8; left: INT;
+begin
+    if s.err # nil then return false; end;
+    left := s.output.len - s.sent;
+    if LEN(body) + 64 > MaxQueue - left then return fail(s, Overflow); end;
+    if s.sent > MaxQueue div 2 then
+        bytes := Buf.bytes(s.output);
+        COPY(bytes[0..left], bytes[s.sent..LEN(bytes)]);
+        s.output.len := left;
+        s.sent := 0;
+    end;
+    if not LspWire.frame(s.output, body) then return fail(s, Overflow); end;
+    return true;
+end;
+
+(* A request or notification, with params already encoded as JSON.
+   id = 0 means a notification. Only this module uses ids 1 and 2. *)
+proc send(var s: Server; id: INT; method, params: []const U8): BOOL;
+var body: Buf.Buf;
+begin
+    Buf.init(body, Heap.heap);
+    defer Buf.done(body);
+    Buf.str(body, "{\"jsonrpc\":\"2.0\"");
+    if id # 0 then Buf.str(body, ",\"id\":"); number(body, id); end;
+    Buf.str(body, ",\"method\":");
+    Json.quote(SYSTEM.ADR(body), method);
+    Buf.str(body, ",\"params\":");
+    Buf.str(body, params);
+    Buf.add(body, '}');
+    return queue(s, Buf.bytes(body));
+end;
+
+(* A notification (id 0) or a caller's request (id >= 3), while the
+   session is ready. params must be a complete JSON value. *)
+proc request*(var s: Server; id: INT; method, params: []const U8): BOOL;
+begin
+    if (s.phase # Phase.running) or (id < 0) or (id = 1) or (id = 2) then return false; end;
+    return send(s, id, method, params);
+end;
+
+(* Free the session, killing its process group if it still lives.
+   The group includes TypeScript's child tsserver processes. Call
+   once after start, including when start fails. shutdown is the
+   normal way to end; done also handles a broken or abandoned server. *)
+proc done*(var s: Server);
+begin
+    if s.toFd >= 0 then Sys.close(s.toFd); end;
+    if s.fromFd >= 0 then Sys.close(s.fromFd); end;
+    if s.pid > 0 then
+        _ := Sys.kill(-s.pid, Sys.sigKill);
+        _ := Sys.kill(s.pid, Sys.sigKill);
+        _, _, _ := Sys.wait(s.pid, true);
+    end;
+    LspWire.done(s.reader);
+    if s.docReady then Json.done(SYSTEM.ADR(s.doc)); s.docReady := false; end;
+    Buf.done(s.output);
+    s.pid := 0;
+    s.toFd := -1;
+    s.fromFd := -1;
+end;
+
+(* Start program in root, an absolute directory, and queue initialize.
+   The program's stdin/stdout are replaced; stderr stays as supplied
+   (normally a broker log). options is a complete JSON value, usually
+   {}, sent as initializationOptions. client names the editor to the
+   server, and must outlast s. The owning broker must ignore
+   SIGPIPE so a closed input pipe gives EPIPE. No reply is waited for. *)
+proc start*(var s: Server; root: []const U8; program: Sys.Program; options, client: []const U8): BOOL;
+var inR, outW: INT; params, uri: Buf.Buf;
+begin
+    s := {toFd: -1, fromFd: -1, client: client};
+    LspWire.init(s.reader);
+    Buf.init(s.output, Heap.heap);
+    if not Json.init(SYSTEM.ADR(s.doc), Heap.heap) then return fail(s, Json.NoRoom); end;
+    s.docReady := true;
+    Buf.init(params, Heap.heap);
+    defer Buf.done(params);
+    Buf.init(uri, Heap.heap);
+    defer Buf.done(uri);
+    if not LspText.uri(root, uri) then return fail(s, Protocol); end;
+    inR, s.toFd := Sys.pipe();
+    if inR < 0 then return fail(s, Io); end;
+    s.fromFd, outW := Sys.pipe();
+    if s.fromFd < 0 then Sys.close(inR); return fail(s, Io); end;
+    program.fds[0] := inR;
+    program.fds[1] := outW;
+    program.dir := root;
+    program.group := -1;
+    s.pid := Sys.spawn(program);
+    Sys.close(inR);
+    Sys.close(outW);
+    if s.pid <= 0 then return fail(s, Io); end;
+    Buf.str(params, "{\"processId\":");
+    number(params, Sys.pid());
+    Buf.str(params, ",\"clientInfo\":{\"name\":");
+    Json.quote(SYSTEM.ADR(params), client);
+    Buf.str(params, "},\"rootUri\":");
+    Json.quote(SYSTEM.ADR(params), Buf.bytes(uri));
+    Buf.str(params, ",\"capabilities\":{\"general\":{\"positionEncodings\":[\"utf-16\"]},\"textDocument\":{\"publishDiagnostics\":{\"versionSupport\":true},\"diagnostic\":{\"dynamicRegistration\":false},\"completion\":{\"completionItem\":{\"snippetSupport\":false}}},\"workspace\":{\"diagnostics\":{\"refreshSupport\":true}}},\"initializationOptions\":");
+    Buf.str(params, options);
+    Buf.add(params, '}');
+    s.deadline := Sys.clock() + StartTime;
+    return send(s, 1, "initialize", Buf.bytes(params));
+end;
+
+(* Begin normal shutdown. The caller keeps calling next until ended
+   or broken, then calls done in either case. *)
+proc shutdown*(var s: Server): BOOL;
+begin
+    if s.phase # Phase.running then return false; end;
+    s.phase := Phase.stopping;
+    s.deadline := Sys.clock() + StopTime;
+    return send(s, 2, "shutdown", "null");
+end;
+
+(* A server request we do not implement answered with its original
+   id, which may be a string. No capabilities for these are advertised. *)
+proc unsupported(var s: Server; id: Json.Value): BOOL;
+var body, why: Buf.Buf;
+begin
+    Buf.init(body, Heap.heap);
+    defer Buf.done(body);
+    Buf.str(body, "{\"jsonrpc\":\"2.0\",\"id\":");
+    Json.write(SYSTEM.ADR(s.doc), SYSTEM.ADR(body), id, {});
+    Buf.init(why, Heap.heap);
+    defer Buf.done(why);
+    Buf.str(why, "Method not supported by ");
+    Buf.str(why, s.client);
+    Buf.str(body, ",\"error\":{\"code\":-32601,\"message\":");
+    Json.quote(SYSTEM.ADR(body), Buf.bytes(why));
+    Buf.str(body, "}}");
+    if s.doc.err # nil then return fail(s, s.doc.err); end;
+    return queue(s, Buf.bytes(body));
+end;
+
+(* A server request answered with a null result. *)
+proc acknowledge(var s: Server; id: Json.Value): BOOL;
+var body: Buf.Buf;
+begin
+    Buf.init(body, Heap.heap);
+    defer Buf.done(body);
+    Buf.str(body, "{\"jsonrpc\":\"2.0\",\"id\":");
+    Json.write(SYSTEM.ADR(s.doc), SYSTEM.ADR(body), id, {});
+    Buf.str(body, ",\"result\":null}");
+    if s.doc.err # nil then return fail(s, s.doc.err); end;
+    return queue(s, Buf.bytes(body));
+end;
+
+(* One complete JSON-RPC message parsed and its lifecycle handled. *)
+proc received(var s: Server; body: []U8): Event;
+var d: ^Json.Doc; id, method, result, error, encoding, provider: Json.Value; n: I64; ok: BOOL;
+begin
+    d := SYSTEM.ADR(s.doc);
+    Json.reset(d);
+    s.value := Json.parse(d, body);
+    if (d^.err # nil) or (Json.kind(d, s.value) # Json.object) or
+        (Json.text(d, Json.member(d, s.value, "jsonrpc")) # "2.0") then
+        _ := fail(s, Protocol);
+        return Event.broken;
+    end;
+    id := Json.member(d, s.value, "id");
+    if (id # Json.None) and (Json.kind(d, id) # Json.number) and (Json.kind(d, id) # Json.string) then
+        _ := fail(s, Protocol);
+        return Event.broken;
+    end;
+    method := Json.member(d, s.value, "method");
+    if method # Json.None then
+        if Json.kind(d, method) # Json.string then _ := fail(s, Protocol); return Event.broken; end;
+        if (id # Json.None) and (Json.text(d, method) = "workspace/diagnostic/refresh") then
+            if not acknowledge(s, id) then return Event.broken; end;
+        elsif id # Json.None then
+            if not unsupported(s, id) then return Event.broken; end;
+            return Event.none;
+        end;
+        return Event.message;
+    end;
+    result := Json.member(d, s.value, "result");
+    error := Json.member(d, s.value, "error");
+    if (id = Json.None) or ((result = Json.None) = (error = Json.None)) then
+        _ := fail(s, Protocol);
+        return Event.broken;
+    end;
+    n, ok := Json.toInt(d, id);
+    if ok and (((n = 1) and (s.phase = Phase.starting)) or ((n = 2) and (s.phase = Phase.stopping))) then
+        if error # Json.None then _ := fail(s, Rejected); return Event.broken; end;
+        if n = 1 then
+            if Json.kind(d, Json.member(d, result, "capabilities")) # Json.object then
+                _ := fail(s, Protocol);
+                return Event.broken;
+            end;
+            encoding := Json.get(d, result, "capabilities.positionEncoding");
+            if (encoding # Json.None) and ((Json.kind(d, encoding) # Json.string) or (Json.text(d, encoding) # "utf-16")) then
+                _ := fail(s, Encoding);
+                return Event.broken;
+            end;
+            provider := Json.get(d, result, "capabilities.diagnosticProvider");
+            s.pull := (provider # Json.None) and (provider # Json.False) and (provider # Json.Null);
+            if not send(s, 0, "initialized", "{}") then return Event.broken; end;
+            s.phase := Phase.running;
+            s.deadline := 0;
+            return Event.initialized;
+        end;
+        if not send(s, 0, "exit", "null") then return Event.broken; end;
+        s.phase := Phase.exiting;
+        return Event.none;
+    end;
+    return Event.message;
+end;
+
+(* What next would wait for: the descriptor it reads, the one it writes
+   while output is queued or else -1, and the ms until it must be
+   called anyway, for a body already read or a deadline, or -1. *)
+proc waits*(const s: Server): (INT, INT, INT);
+var write, ms: INT; now: I64;
+begin
+    if (s.phase = Phase.failed) or (s.phase = Phase.ended) then return -1, -1, 0; end;
+    write := -1;
+    if (s.sent < s.output.len) and (s.toFd >= 0) then write := s.toFd; end;
+    ms := -1;
+    if s.deadline > 0 then
+        now := Sys.clock();
+        ms := 0;
+        if s.deadline > now then ms := INT((s.deadline - now) div 1000000) + 1; end;
+    end;
+    if LspWire.ready(s.reader) then ms := 0; end;
+    return s.fromFd, write, ms;
+end;
+
+(* The next event, with at most ms milliseconds waiting for pipe IO.
+   ms must be non-negative; the broker uses zero. A returned message
+   is in doc/value until the next call. Incoming messages are drained
+   before reading again, but writes get a turn even when input is busy. *)
+proc next*(var s: Server; ms: INT): Event;
+var result: LspWire.Result; bytes: []const U8; body: []U8; fd, n, last: INT; writes: [1]INT; nw: INT; input: [Chunk]U8;
+begin
+    if s.phase = Phase.failed then return Event.broken; end;
+    if s.phase = Phase.ended then return Event.ended; end;
+    if (s.deadline > 0) and (Sys.clock() >= s.deadline) then
+        _ := fail(s, Timeout);
+        return Event.broken;
+    end;
+    (* A write no larger than PIPE_BUF after POLLOUT cannot wait.
+       Ignore SIGPIPE in the owning broker so EPIPE reaches us. *)
+    if (s.sent < s.output.len) and (Sys.readyFor([], [s.toFd], 0) = s.toFd) then
+        last := s.sent + Chunk;
+        if last > s.output.len then last := s.output.len; end;
+        bytes := Buf.bytes(s.output);
+        n := Sys.write(s.toFd, bytes[s.sent..last]);
+        if (n < 0) and (n # Sys.errIntr) then _ := fail(s, Io); return Event.broken; end;
+        if n > 0 then INC(s.sent, n); end;
+        if s.sent = s.output.len then Buf.reset(s.output); s.sent := 0; end;
+        return Event.none;
+    end;
+    if (s.phase = Phase.exiting) and (s.output.len = 0) and (s.toFd >= 0) then
+        Sys.close(s.toFd);
+        s.toFd := -1;
+    end;
+    result, body := LspWire.take(s.reader);
+    if result = LspWire.Result.message then return received(s, body); end;
+    if result = LspWire.Result.broken then _ := fail(s, Protocol); return Event.broken; end;
+    nw := 0;
+    if s.sent < s.output.len then writes[0] := s.toFd; nw := 1; end;
+    if ms < 0 then ms := 0; end;
+    if ms > 50 then ms := 50; end;    (* deadlines still checked promptly *)
+    fd := Sys.readyFor([s.fromFd], writes[0..nw], ms);
+    if fd # s.fromFd then return Event.none; end;
+    n := Sys.read(s.fromFd, input);
+    (* The read buffer is separate from output: queued writes and
+       parsed strings must never share mutable storage. *)
+    if n = Sys.errIntr then return Event.none; end;
+    if n = 0 then
+        if s.phase = Phase.exiting then s.phase := Phase.ended; return Event.ended; end;
+        _ := fail(s, Io);
+        return Event.broken;
+    end;
+    if n < 0 then _ := fail(s, Io); return Event.broken; end;
+    if not LspWire.feed(s.reader, input[0..n]) then _ := fail(s, Protocol); return Event.broken; end;
+    return Event.none;
+end;
+
+end LspServer.

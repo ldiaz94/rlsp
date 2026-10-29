@@ -1,0 +1,223 @@
+(* LspWire: LSP's Content-Length envelopes, independent of the pipe.
+
+   A read may end anywhere: inside a header, a UTF-8 character, or
+   between two messages. feed keeps its bytes; take gives one whole
+   body at a time, without copying it. The body lasts until feed or
+   done. Consumed bytes move only when more bytes arrive.
+
+   Neither procedure waits. The broker chooses when to read or write
+   its pipes; this module knows nothing of processes or JSON. Header
+   and body limits bound an incomplete message's memory use.
+   It depends on Buf, Heap and Str. *)
+module LspWire;
+import Buf, Heap, Str, Out, Rt;
+
+const
+    MaxHeader* = 8192;                (* longest header, in bytes *)
+    MaxBody* = 16 * 1024 * 1024;      (* longest body, in bytes *)
+
+type
+    (* What take found: no whole message yet, one, or a framing error. *)
+    Result* = (more, message, broken);
+
+    (* The bytes read and not yet given out. *)
+    Reader* = record
+        data: Buf.Buf;         (* all bytes fed, from the oldest kept *)
+        at: INT;               (* first byte not consumed *)
+        size: INT;             (* -1 for a header, otherwise the body's size *)
+        bad: BOOL;             (* a framing error cannot be recovered from *)
+    end;
+
+proc init*(var r: Reader);
+begin
+    r := {size: -1};
+    Buf.init(r.data, Heap.heap);
+end;
+
+proc done*(var r: Reader);
+begin
+    Buf.done(r.data);
+end;
+
+(* Bytes from the pipe, copied in. false after a framing error or when
+   the bytes not yet consumed exceed the size of the largest frame.
+   A caller feeds bounded reads and takes every available message. *)
+proc feed*(var r: Reader; s: []const U8): BOOL;
+var data: []U8; left: INT;
+begin
+    if r.bad then return false; end;
+    left := r.data.len - r.at;
+    if LEN(s) > MaxBody + MaxHeader - left then r.bad := true; return false; end;
+    if r.at > 0 then
+        data := Buf.bytes(r.data);
+        COPY(data[0..left], data[r.at..LEN(data)]);
+        r.data.len := left;
+        r.at := 0;
+    end;
+    Buf.str(r.data, s);
+    return true;
+end;
+
+(* The one Content-Length, a non-negative decimal byte count.
+   Other headers are allowed; duplicate lengths are rejected even
+   when equal, so the stream never has two possible interpretations. *)
+proc length(header: []const U8): INT;
+var line, name, value: []const U8; more, colon, found: BOOL; n, i: INT;
+begin
+    more := true;
+    found := false;
+    n := 0;
+    while more do
+        line, header, more := Str.cut(header, "\r\n");
+        name, value, colon := Str.cut(line, ":");
+        if not colon or (LEN(name) = 0) then return -1; end;
+        if Str.eqFold(name, "Content-Length") then
+            if found then return -1; end;
+            found := true;
+            value := Str.trim(value);
+            if LEN(value) = 0 then return -1; end;
+            for i := 0 to LEN(value) - 1 do
+                if not Str.isDigit(value[i]) then return -1; end;
+                (* Check before multiplying: even a hostile decimal
+                   with thousands of digits must not overflow. *)
+                if n > (MaxBody - (INT(value[i]) - '0')) div 10 then return -1; end;
+                n := n * 10 + value[i] - '0';
+            end;
+        end;
+    end;
+    if not found then return -1; end;
+    return n;
+end;
+
+(* The next body, if complete. Empty bodies are framed successfully;
+   the JSON reader will reject them. broken is permanent. *)
+proc take*(var r: Reader): (Result, []U8);
+var data: []U8; n, at: INT;
+begin
+    if r.bad then return Result.broken, []; end;
+    data := Buf.bytes(r.data);
+    if r.size < 0 then
+        n := Str.find(data[r.at..LEN(data)], "\r\n\r\n");
+        if n < 0 then
+            if LEN(data) - r.at >= MaxHeader then r.bad := true; return Result.broken, []; end;
+            return Result.more, [];
+        end;
+        if n + 4 > MaxHeader then r.bad := true; return Result.broken, []; end;
+        r.size := length(data[r.at..r.at + n]);
+        if r.size < 0 then r.bad := true; return Result.broken, []; end;
+        INC(r.at, n + 4);
+    end;
+    if LEN(data) - r.at < r.size then return Result.more, []; end;
+    at := r.at;
+    INC(r.at, r.size);
+    r.size := -1;
+    return Result.message, data[at..r.at];
+end;
+
+(* Whether take would give a body, or say broken, without more bytes
+   fed: so a caller knows whether to wait for the pipe. *)
+proc ready*(const r: Reader): BOOL;
+var data: []const U8; n, size: INT;
+begin
+    if r.bad then return true; end;
+    data := Buf.bytes(r.data);
+    size := r.size;
+    n := r.at;
+    if size < 0 then
+        n := Str.find(data[r.at..LEN(data)], "\r\n\r\n");
+        if n < 0 then return LEN(data) - r.at >= MaxHeader; end;
+        size := length(data[r.at..r.at + n]);
+        if size < 0 then return true; end;
+        n := r.at + n + 4;
+    end;
+    return LEN(data) - n >= size;
+end;
+
+(* A complete envelope appended to out, ready to queue for writing. *)
+proc frame*(var out: Buf.Buf; body: []const U8): BOOL;
+var digits: [20]U8; n: INT;
+begin
+    if LEN(body) > MaxBody then return false; end;
+    Buf.str(out, "Content-Length: ");
+    digits, n := Str.fromInt(LEN(body));
+    Buf.str(out, digits[0..n]);
+    Buf.str(out, "\r\n\r\n");
+    Buf.str(out, body);
+    return true;
+end;
+
+(* Stop the self-test with what failed. *)
+proc check(ok: BOOL; what: []const U8);
+begin
+    if not ok then Rt.stop(what); end;
+end;
+
+(* A malformed header is refused, and stays refused. *)
+proc bad(header: []const U8);
+var r: Reader; result: Result;
+begin
+    init(r);
+    defer done(r);
+    check(feed(r, header), "feed malformed header");
+    result, _ := take(r);
+    check(result = Result.broken, "reject malformed header");
+    check(not feed(r, "Content-Length: 0\r\n\r\n"), "framing error stays broken");
+end;
+
+(* Frames split at every byte, joined, malformed and too long. *)
+proc frames;
+const Body = "{\"text\":\"é😀\"}";
+var r: Reader; out: Buf.Buf; result: Result; body, bytes: []const U8; split, i: INT;
+begin
+    Buf.init(out, Heap.heap);
+    defer Buf.done(out);
+    check(frame(out, Body), "frame");
+    bytes := Buf.bytes(out);
+    (* Split at every byte, including each byte of the UTF-8 text. *)
+    for split := 0 to LEN(bytes) - 1 do
+        init(r);
+        check(feed(r, bytes[0..split]), "first fragment");
+        check(not ready(r), "a part of a frame isn't ready");
+        result, _ := take(r);
+        check(result = Result.more, "partial frame must wait");
+        check(feed(r, bytes[split..LEN(bytes)]), "last fragment");
+        check(ready(r), "a whole frame is ready");
+        result, body := take(r);
+        check((result = Result.message) and (body = Body), "complete UTF-8 body");
+        result, _ := take(r);
+        check(result = Result.more, "message consumed once");
+        done(r);
+    end;
+    init(r);
+    defer done(r);
+    for i := 0 to LEN(bytes) - 1 do
+        check(feed(r, bytes[i..i + 1]), "byte at a time");
+        result, body := take(r);
+    end;
+    check((result = Result.message) and (body = Body), "one byte reads");
+    check(feed(r, "content-length: 1\r\nContent-Type: application/vscode-jsonrpc; charset=utf-8\r\n\r\nxContent-Length: 0\r\n\r\n"),
+        "multiple frames");
+    result, body := take(r);
+    check((result = Result.message) and (body = "x"), "case and extra header");
+    result, body := take(r);
+    check((result = Result.message) and (LEN(body) = 0), "empty second body");
+    bad("Content-Type: application/json\r\n\r\n");
+    bad("Content-Length: -1\r\n\r\n");
+    bad("Content-Length: 1\r\nContent-Length: 1\r\n\r\n");
+    bad("Content-Length: 1x\r\n\r\n");
+    bad("Content-Length: 999999999999999999999999999999\r\n\r\n");
+    bad("Content-Length: 16777217\r\n\r\n");
+    bad("Content-Length:\r\n\r\n");
+    Buf.reset(out);
+    for i := 0 to MaxHeader - 1 do Buf.add(out, 'x'); end;
+    bad(Buf.bytes(out));
+end;
+
+(* Self-test. *)
+proc main*;
+begin
+    frames();
+    Out.str("LspWire passed\n");
+end;
+
+end LspWire.

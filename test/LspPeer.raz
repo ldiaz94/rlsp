@@ -1,0 +1,123 @@
+(* A small LSP peer for the session tests. It checks the handshake and
+   unsaved text, asks an unsupported request with a string id, and
+   answers diagnostics and definition without any installed server. *)
+module LspPeer;
+import LspWire, Json, Buf, Heap, Sys, Str, Rt;
+import SYSTEM;
+
+var
+    reader: LspWire.Reader;
+    doc: Json.Doc;
+    output: Buf.Buf;
+    value: Json.Value;
+    initialized, opened, changed, shutting, answered: BOOL;
+
+proc check(ok: BOOL);
+begin
+    if not ok then Rt.exit(1); end;
+end;
+
+proc send(body: []const U8);
+var bytes: []const U8; n: INT;
+begin
+    Buf.reset(output);
+    check(LspWire.frame(output, body));
+    bytes := Buf.bytes(output);
+    while LEN(bytes) > 0 do
+        n := Sys.write(Sys.stdout, bytes);
+        check(n > 0);
+        bytes := bytes[n..LEN(bytes)];
+    end;
+end;
+
+proc handle: BOOL;
+var method, text: []const U8; id: I64; ok: BOOL;
+begin
+    method := Json.text(SYSTEM.ADR(doc), Json.member(SYSTEM.ADR(doc), value, "method"));
+    id, ok := Json.toInt(SYSTEM.ADR(doc), Json.member(SYSTEM.ADR(doc), value, "id"));
+    if method = "initialize" then
+        check(ok and (id = 1));
+        match Sys.env("RLSP_TEST") of
+        | "exit": return false;
+        | "json": send("{"); return true;
+        | "reject": send("{\"jsonrpc\":\"2.0\",\"id\":1,\"error\":{\"code\":-32603,\"message\":\"test rejection\"}}"); return true;
+        | "encoding": send("{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"capabilities\":{\"positionEncoding\":\"utf-8\"}}}"); return true;
+        | "id": send("{\"jsonrpc\":\"2.0\",\"id\":{},\"result\":null}"); return true;
+        | else:
+        end;
+        check(Json.text(SYSTEM.ADR(doc), Json.get(SYSTEM.ADR(doc), value, "params.capabilities.general.positionEncodings[0]")) = "utf-16");
+        send("{\"jsonrpc\":\"2.0\",\"id\":\"peer-request\",\"method\":\"rlsp/test\",\"params\":{}}");
+    elsif method = "" then
+        check(Json.text(SYSTEM.ADR(doc), Json.member(SYSTEM.ADR(doc), value, "id")) = "peer-request");
+        id, ok := Json.toInt(SYSTEM.ADR(doc), Json.get(SYSTEM.ADR(doc), value, "error.code"));
+        check(ok and (id = -32601));
+        answered := true;
+        send("{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"capabilities\":{\"textDocumentSync\":2,\"definitionProvider\":true}}}");
+    elsif method = "initialized" then
+        check(answered);
+        initialized := true;
+    elsif method = "textDocument/didOpen" then
+        check(initialized);
+        text := Json.text(SYSTEM.ADR(doc), Json.get(SYSTEM.ADR(doc), value, "params.textDocument.text"));
+        check(Str.hasPrefix(text, "export const answer = 1;\nanswer;\n"));
+        opened := true;
+        send("{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/publishDiagnostics\",\"params\":{\"version\":1,\"diagnostics\":[{\"range\":{\"start\":{\"line\":2,\"character\":6},\"end\":{\"line\":2,\"character\":12}},\"severity\":1,\"code\":2322,\"message\":\"Type 'number' is not assignable to type 'string'.\"}]}}");
+    elsif method = "textDocument/didChange" then
+        check(opened);
+        text := Json.text(SYSTEM.ADR(doc), Json.get(SYSTEM.ADR(doc), value, "params.contentChanges[0].text"));
+        check(Str.hasPrefix(text, "export const renamed = 1;\nrenamed;\n"));
+        check(LEN(text) > 100000);
+        check(Str.hasSuffix(text, "*/\n"));
+        changed := true;
+        send("{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/publishDiagnostics\",\"params\":{\"version\":2,\"diagnostics\":[]}}");
+    elsif method = "textDocument/definition" then
+        check(opened and ok);
+        if id = 3 then
+            check(not changed);
+            send("{\"jsonrpc\":\"2.0\",\"id\":3,\"result\":[{\"uri\":\"file:///test.ts\",\"range\":{\"start\":{\"line\":0,\"character\":13},\"end\":{\"line\":0,\"character\":19}}}]}");
+        else
+            check(changed and (id = 4));
+            send("{\"jsonrpc\":\"2.0\",\"id\":4,\"result\":[{\"uri\":\"file:///test.ts\",\"range\":{\"start\":{\"line\":0,\"character\":13},\"end\":{\"line\":0,\"character\":20}}}]}");
+        end;
+    elsif method = "textDocument/didClose" then
+        check(changed);
+        opened := false;
+    elsif method = "shutdown" then
+        check(not opened and changed and ok and (id = 2));
+        shutting := true;
+        send("{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":null}");
+    elsif method = "exit" then
+        check(shutting);
+        return false;
+    else
+        check(false);
+    end;
+    return true;
+end;
+
+proc main*;
+var input: [4096]U8; n: INT; result: LspWire.Result; body: []U8;
+begin
+    LspWire.init(reader);
+    defer LspWire.done(reader);
+    check(Json.init(SYSTEM.ADR(doc), Heap.heap));
+    defer Json.done(SYSTEM.ADR(doc));
+    Buf.init(output, Heap.heap);
+    defer Buf.done(output);
+    while true do
+        result, body := LspWire.take(reader);
+        check(result # LspWire.Result.broken);
+        if result = LspWire.Result.message then
+            Json.reset(SYSTEM.ADR(doc));
+            value := Json.parse(SYSTEM.ADR(doc), body);
+            check(doc.err = nil);
+            if not handle() then return; end;
+        else
+            n := Sys.read(Sys.stdin, input);
+            check(n > 0);
+            check(LspWire.feed(reader, input[0..n]));
+        end;
+    end;
+end;
+
+end LspPeer.

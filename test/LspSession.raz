@@ -1,0 +1,218 @@
+(* The same unsaved-document conversation with a strict test peer,
+   or with typescript-language-server when --typescript is given.
+   The file does not exist on disk: definitions and diagnostics must
+   come from the text we send, including the second version. *)
+module LspSession;
+import LspServer, LspText, Json, Sys, Opt, Buf, Heap, Str, Out, Rt;
+import SYSTEM;
+
+var verbose: BOOL; active: ^LspServer.Server;
+
+proc check(ok: BOOL; what: []const U8);
+begin
+    if not ok then
+        Out.str(what); Out.ln;
+        if active # nil then LspServer.done(active^); active := nil; end;
+        Rt.exit(1);
+    end;
+end;
+
+proc event(var s: LspServer.Server): LspServer.Event;
+var ev: LspServer.Event; trace: Buf.Buf;
+begin
+    ev := LspServer.next(s, 50);
+    if verbose and (ev = LspServer.Event.message) then
+        Buf.init(trace, Heap.heap);
+        Json.write(SYSTEM.ADR(s.doc), SYSTEM.ADR(trace), s.value, {});
+        Out.str(Buf.bytes(trace)); Out.ln; Out.flush();
+        Buf.done(trace);
+    end;
+    if ev = LspServer.Event.broken then
+        Out.str(MSG(s.err));
+        Out.ln;
+        Out.str(Json.text(SYSTEM.ADR(s.doc), Json.get(SYSTEM.ADR(s.doc), s.value, "error.message")));
+        Out.ln;
+        check(false, "server session failed");
+    end;
+    return ev;
+end;
+
+(* Keep reading until definition and the expected diagnostics arrive,
+   in either order. TypeScript may first publish an empty set while
+   its semantic check is still running. *)
+proc answers(var s: LspServer.Server; id: INT; changed: BOOL);
+var ev: LspServer.Event; deadline: I64; definition, diagnostics, ok: BOOL;
+    method: []const U8; n: I64; d: ^Json.Doc; v, result, items: Json.Value; i: INT;
+begin
+    deadline := Sys.clock() + 20000000000;
+    d := SYSTEM.ADR(s.doc);
+    while not (definition and diagnostics) do
+        if Sys.clock() >= deadline then
+            check(false, "timed out waiting for definition and diagnostics");
+        end;
+        ev := event(s);
+        if ev # LspServer.Event.message then continue; end;
+        v := s.value;
+        method := Json.text(d, Json.member(d, v, "method"));
+        if method = "textDocument/publishDiagnostics" then
+            items := Json.get(d, v, "params.diagnostics");
+            if changed then
+                n, ok := Json.toInt(d, Json.get(d, v, "params.version"));
+                (* This server may omit version even when the client
+                   supports it. Wait for the old error to clear. *)
+                diagnostics := ((ok and (n = 2)) or (Json.get(d, v, "params.version") = Json.None)) and
+                    (Json.len(d, items) = 0);
+            else
+                for i := 0 to Json.len(d, items) - 1 do
+                    n, ok := Json.toInt(d, Json.member(d, Json.item(d, items, i), "code"));
+                    if ok and (n = 2322) then diagnostics := true; end;
+                end;
+            end;
+        elsif LEN(method) = 0 then
+            n, ok := Json.toInt(d, Json.member(d, v, "id"));
+            if ok and (n = id) then
+                result := Json.member(d, v, "result");
+                check(Json.kind(d, result) = Json.array, "definition must return locations");
+                check(Json.len(d, result) = 1, "one definition");
+                n, ok := Json.toInt(d, Json.get(d, Json.item(d, result, 0), "range.start.line"));
+                check(ok and (n = 0), "definition on first line");
+                n, ok := Json.toInt(d, Json.get(d, Json.item(d, result, 0), "range.end.character"));
+                if changed then
+                    check(ok and (n = 20), "definition must see unsaved renamed symbol");
+                else
+                    check(ok and (n = 19), "definition must see unsaved original symbol");
+                end;
+                definition := true;
+            end;
+        end;
+    end;
+end;
+
+(* Malformed replies and a child that exits early must fail promptly,
+   without killing the client with SIGPIPE or leaving a process behind. *)
+proc failures(root, peer: []const U8);
+const Modes: []const []const U8 = ["exit", "json", "reject", "encoding", "id"];
+var s: LspServer.Server; program: Sys.Program; env: Buf.Buf; i: INT; ev: LspServer.Event; deadline: I64;
+begin
+    Buf.init(env, Heap.heap);
+    defer Buf.done(env);
+    for i := 0 to LEN(Modes) - 1 do
+        Buf.reset(env);
+        Buf.str(env, "RLSP_TEST=");
+        Buf.str(env, Modes[i]);
+        program := {path: peer, args: [peer], env: [Buf.bytes(env)]};
+        active := SYSTEM.ADR(s);
+        check(LspServer.start(s, root, program, "{}", "rlsp"), "start failing peer");
+        check(not LspServer.request(s, 3, "test", "{}"), "no requests before initialization");
+        deadline := Sys.clock() + 3000000000;
+        repeat
+            ev := LspServer.next(s, 50);
+            check(Sys.clock() < deadline, "failing peer must not hang");
+        until ev = LspServer.Event.broken;
+        check(s.phase = LspServer.Phase.failed, "broken session stays failed");
+        if Modes[i] = "exit" then check(s.err = LspServer.Io, "early exit");
+        elsif Modes[i] = "reject" then check(s.err = LspServer.Rejected, "initialization rejected");
+        elsif Modes[i] = "encoding" then check(s.err = LspServer.Encoding, "unsupported encoding");
+        else check(s.err = LspServer.Protocol, "malformed response"); end;
+        LspServer.done(s);
+        active := nil;
+    end;
+end;
+
+proc main*;
+var s: LspServer.Server; p: Opt.Parser; real: BOOL; root, peer: []const U8; err, i: INT;
+    program: Sys.Program; params, uri, text, path, options: Buf.Buf; ev: LspServer.Event; digits: [20]U8; k: INT;
+    tsserver: []const U8;
+begin
+    Opt.init(p, "LspSession", [Opt.option("", 't', "typescript", "", "use the installed TypeScript server"),
+        Opt.option("", 'v', "verbose", "", "print received messages"),
+        Opt.option("", 's', "tsserver", "PATH", "path to TypeScript's tsserver.js")]);
+    while Opt.next(p) do
+        if p.letter = 't' then real := true; end;
+        if p.letter = 'v' then verbose := true; end;
+        if p.letter = 's' then tsserver := p.value; end;
+    end;
+    root, err := Sys.workDir();
+    check(err = 0, "working directory");
+    Buf.init(path, Heap.heap);
+    defer Buf.done(path);
+    Buf.str(path, root);
+    Buf.str(path, "/build/LspPeer");
+    peer := Buf.bytes(path);
+    program := {path: peer, args: [peer]};
+    if real then program := {path: "typescript-language-server", args: ["typescript-language-server", "--stdio"]}; end;
+    Buf.init(options, Heap.heap);
+    defer Buf.done(options);
+    if LEN(tsserver) > 0 then
+        Buf.str(options, "{\"tsserver\":{\"path\":");
+        Json.quote(SYSTEM.ADR(options), tsserver);
+        Buf.str(options, "}}");
+    else
+        Buf.str(options, "{}");
+    end;
+    check(Sys.ignore(Sys.sigPipe, true) = 0, "ignore broken pipes");
+    if not real then failures(root, peer); end;
+    active := SYSTEM.ADR(s);
+    if not LspServer.start(s, root, program, Buf.bytes(options), "rlsp") then
+        Out.str(MSG(s.err)); Out.ln;
+        check(false, "start server");
+    end;
+    defer LspServer.done(s);
+    repeat ev := event(s); until ev = LspServer.Event.initialized;
+    Buf.init(params, Heap.heap);
+    defer Buf.done(params);
+    Buf.init(uri, Heap.heap);
+    defer Buf.done(uri);
+    Buf.init(text, Heap.heap);
+    defer Buf.done(text);
+    Buf.reset(path);
+    Buf.str(path, root);
+    Buf.str(path, "/build/rlsp-unsaved-");
+    digits, k := Str.fromInt(Sys.pid());
+    Buf.str(path, digits[0..k]);
+    Buf.str(path, ".ts");
+    check(LspText.uri(Buf.bytes(path), uri), "file URI");
+    _, err := Sys.info(Buf.bytes(path));
+    check(err = Sys.errNoEntry, "test file must not exist on disk");
+    Buf.str(params, "{\"textDocument\":{\"uri\":");
+    Json.quote(SYSTEM.ADR(params), Buf.bytes(uri));
+    Buf.str(params, ",\"languageId\":\"typescript\",\"version\":1,\"text\":");
+    Json.quote(SYSTEM.ADR(params), "export const answer = 1;\nanswer;\nexport const broken: string = 1;\n");
+    Buf.str(params, "}}");
+    check(LspServer.request(s, 0, "textDocument/didOpen", Buf.bytes(params)), "didOpen");
+    Buf.reset(params);
+    Buf.str(params, "{\"textDocument\":{\"uri\":");
+    Json.quote(SYSTEM.ADR(params), Buf.bytes(uri));
+    Buf.str(params, "},\"position\":{\"line\":1,\"character\":2}}");
+    check(LspServer.request(s, 3, "textDocument/definition", Buf.bytes(params)), "definition");
+    answers(s, 3, false);
+    (* More than the pipe can hold, to exercise partial queued writes. *)
+    Buf.str(text, "export const renamed = 1;\nrenamed;\nexport const broken: string = \"ok\";\n/*");
+    for i := 0 to 100000 do Buf.add(text, 'x'); end;
+    Buf.str(text, "*/\n");
+    Buf.reset(params);
+    Buf.str(params, "{\"textDocument\":{\"uri\":");
+    Json.quote(SYSTEM.ADR(params), Buf.bytes(uri));
+    Buf.str(params, ",\"version\":2},\"contentChanges\":[{\"text\":");
+    Json.quote(SYSTEM.ADR(params), Buf.bytes(text));
+    Buf.str(params, "}]}");
+    check(LspServer.request(s, 0, "textDocument/didChange", Buf.bytes(params)), "didChange");
+    Buf.reset(params);
+    Buf.str(params, "{\"textDocument\":{\"uri\":");
+    Json.quote(SYSTEM.ADR(params), Buf.bytes(uri));
+    Buf.str(params, "},\"position\":{\"line\":1,\"character\":2}}");
+    check(LspServer.request(s, 4, "textDocument/definition", Buf.bytes(params)), "changed definition");
+    answers(s, 4, true);
+    Buf.reset(params);
+    Buf.str(params, "{\"textDocument\":{\"uri\":");
+    Json.quote(SYSTEM.ADR(params), Buf.bytes(uri));
+    Buf.str(params, "}}");
+    check(LspServer.request(s, 0, "textDocument/didClose", Buf.bytes(params)), "didClose");
+    check(LspServer.shutdown(s), "shutdown");
+    check(not LspServer.request(s, 5, "test", "{}"), "no requests during shutdown");
+    repeat ev := event(s); until ev = LspServer.Event.ended;
+    if real then Out.str("TypeScript unsaved diagnostics and definitions passed\n");
+    else Out.str("LSP session and shutdown passed\n"); end;
+end;
+
+end LspSession.
